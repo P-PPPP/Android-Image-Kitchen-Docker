@@ -3,3 +3,6 @@ split_img/
 ramdisk/
 *new.*
 out/
+
+__pycache__/
+*.pyc
