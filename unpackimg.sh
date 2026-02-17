@@ -2,11 +2,24 @@
 # AIK-Linux/unpackimg: split image and unpack ramdisk
 # osm0sis @ xda-developers
 
-cleanup() { "$aik/cleanup.sh" $local --quiet; }
-abort() { echo "Error!"; }
+script_path="${BASH_SOURCE:-$0}";
+script_dir="$(cd "$(dirname "$script_path")" && pwd -P)";
+. "$script_dir/lib/runtime.sh";
+
+AIK_REQUIRED_TOOLS=(cpio file dd xz lzop lz4 tail unpackbootimg mkbootimg mkimage dumpimage);
+aik_bootstrap "$script_path" "$@" || exit $?;
+[ "$AIK_FORWARDED" = "1" ] && exit 0;
+if [ "$AIK_DOCTOR" = "1" ]; then
+  aik_doctor "${AIK_REQUIRED_TOOLS[@]}";
+  exit $?;
+fi;
+set -- "${AIK_ARGS[@]}";
+
+cleanup() { "$aik/cleanup.sh" --runtime "$AIK_RUNTIME" --container-image "$AIK_CONTAINER_IMAGE" $local --quiet; }
+abort() { [ "$1" ] && echo "$1"; echo "Error!"; }
 
 case $1 in
-  --help) echo "usage: unpackimg.sh [--local] [--nosudo] <file>"; exit 1;;
+  --help) echo "usage: unpackimg.sh [--runtime native|auto|container] [--container-image <image>] [--strict-native] [--doctor] [--native] [--local] [--nosudo] <file>"; exit 1;;
   --local) local="--local"; shift;;
 esac;
 case $1 in
@@ -14,47 +27,28 @@ case $1 in
   --sudo) shift;;
 esac;
 if [ ! "$nosudo" ]; then
-  sudo=sudo; sumsg=" (as root)";
+  if command -v sudo >/dev/null 2>&1; then
+    sudo=sudo; sumsg=" (as root)";
+  fi;
 fi;
 
 case $(uname -s) in
-  Darwin|Macintosh)
-    plat="macos";
-    readlink() { perl -MCwd -e 'print Cwd::abs_path shift' "$2"; }
-  ;;
-  *) plat="linux";;
+  Darwin|Macintosh) plat="macos"; statarg="-f %Su";;
+  *) plat="linux"; statarg="-c %U";;
 esac;
-arch=$plat/`uname -m`;
+arch=$AIK_OS/$AIK_ARCH;
 
 aik="${BASH_SOURCE:-$0}";
-aik="$(dirname "$(readlink -f "$aik")")";
+aik="$(dirname "$(aik_readlink_f "$aik")")";
 bin="$aik/bin";
-cur="$(readlink -f "$PWD")";
-
-case $plat in
-  macos)
-    cpio="env DYLD_LIBRARY_PATH="$bin/$arch" "$bin/$arch/cpio"";
-    statarg="-f %Su";
-    dd() { DYLD_LIBRARY_PATH="$bin/$arch" "$bin/$arch/dd" "$@"; }
-    file() { DYLD_LIBRARY_PATH="$bin/$arch" "$bin/$arch/file" "$@"; }
-    lzma() { DYLD_LIBRARY_PATH="$bin/$arch" "$bin/$arch/xz" "$@"; }
-    lzop() { DYLD_LIBRARY_PATH="$bin/$arch" "$bin/$arch/lzop" "$@"; }
-    tail() { DYLD_LIBRARY_PATH="$bin/$arch" "$bin/$arch/tail" "$@"; }
-    truncate() { DYLD_LIBRARY_PATH="$bin/$arch" "$bin/$arch/truncate" "$@"; }
-    xz() { DYLD_LIBRARY_PATH="$bin/$arch" "$bin/$arch/xz" "$@"; }
-  ;;
-  linux)
-    cpio=cpio;
-    [ "$(cpio --version | head -n1 | rev | cut -d\  -f1 | rev)" = "2.13" ] && cpiowarning=1;
-    statarg="-c %U";
-  ;;
-esac;
+cur="$(aik_readlink_f "$PWD")";
+cpio=cpio;
+[ "$(cpio --version | head -n1 | rev | cut -d\  -f1 | rev)" = "2.13" ] && cpiowarning=1;
 
 if [ ! "$local" ]; then
   cd "$aik";
 fi;
-chmod -R 755 "$bin" "$aik"/*.sh;
-chmod 644 "$bin/magic" "$bin/androidbootimg.magic" "$bin/boot_signer.jar" "$bin/avb/"* "$bin/chromeos/"*;
+aik_fix_permissions "$aik" "$bin";
 
 img="$1";
 [ -f "$cur/$1" ] && img="$cur/$1";
@@ -67,7 +61,7 @@ if [ ! "$img" ]; then
     break;
   done < <(ls *.elf *.img *.sin 2>/dev/null);
 fi;
-img="$(readlink -f "$img")";
+img="$(aik_readlink_f "$img")";
 if [ ! -f "$img" ]; then
   echo "No image file supplied.";
   abort;
@@ -109,10 +103,10 @@ if [ "$(echo $imgtest | awk '{ print $2 }' | cut -d, -f1)" = "signing" ]; then
   case $sigtype in
     BLOB)
       cp -f "$img" "$file";
-      "$bin/$arch/blobunpack" "$file" | tail -n+5 | cut -d" " -f2 | dd bs=1 count=3 > "$file-blobtype" 2>/dev/null;
+      aik_exec blobunpack "$file" | tail -n+5 | cut -d" " -f2 | dd bs=1 count=3 > "$file-blobtype" 2>/dev/null;
       mv -f "$file."* "$file";
     ;;
-    CHROMEOS) "$bin/$arch/futility" vbutil_kernel --get-vmlinuz "$img" --vmlinuz-out "$file";;
+    CHROMEOS) aik_exec futility vbutil_kernel --get-vmlinuz "$img" --vmlinuz-out "$file";;
     DHTB) dd bs=4096 skip=512 iflag=skip_bytes conv=notrunc if="$img" of="$file" 2>/dev/null;;
     NOOK)
       dd bs=1048576 count=1 conv=notrunc if="$img" of="$file-master_boot.key" 2>/dev/null;
@@ -123,7 +117,7 @@ if [ "$(echo $imgtest | awk '{ print $2 }' | cut -d, -f1)" = "signing" ]; then
       dd bs=262144 skip=1 conv=notrunc if="$img" of="$file" 2>/dev/null;
     ;;
     SIN*)
-      "$bin/$arch/sony_dump" . "$img" >/dev/null;
+      aik_exec sony_dump . "$img" >/dev/null;
       mv -f "$file."* "$file";
       rm -f "$file-sigtype";
     ;;
@@ -134,7 +128,9 @@ fi;
 imgtest="$(file -m "$bin/androidbootimg.magic" "$img" 2>/dev/null | cut -d: -f2-)";
 if [ "$(echo $imgtest | awk '{ print $2 }' | cut -d, -f1)" = "bootimg" ]; then
   [ "$(echo $imgtest | awk '{ print $3 }')" = "PXA" ] && typesuffix=-PXA;
-  echo "$(echo $imgtest | awk '{ print $1 }')$typesuffix" > "$file-imgtype";
+  imgbase="$(echo $imgtest | awk '{ print $1 }')";
+  [ "$imgbase" = "Android" ] && imgbase="AOSP";
+  echo "$imgbase$typesuffix" > "$file-imgtype";
   imgtype=$(cat "$file-imgtype");
 else
   cd ..;
@@ -165,7 +161,7 @@ case $(echo $imgtest | awk '{ print $3 }') in
     echo " ";
     echo "Warning: A dump of your device's aboot.img is required to re-Loki!";
     echo " ";
-    "$bin/$arch/loki_tool" unlok "$img" "$file" >/dev/null;
+    aik_exec loki_tool unlok "$img" "$file" >/dev/null;
     img="$file";
   ;;
   AMONET)
@@ -220,26 +216,26 @@ case $imgtype in
   AOSP_VNDR) vendor=vendor_;;
 esac;
 case $imgtype in
-  AOSP|AOSP_VNDR) "$bin/$arch/unpackbootimg" -i "$img";;
-  AOSP-PXA) "$bin/$arch/pxa-unpackbootimg" -i "$img";;
+  AOSP|AOSP_VNDR) aik_exec_unpackbootimg -i "$img";;
+  AOSP-PXA) aik_exec pxa-unpackbootimg -i "$img";;
   ELF)
     mkdir elftool_out;
-    "$bin/$arch/elftool" unpack -i "$img" -o elftool_out >/dev/null;
+    aik_exec elftool unpack -i "$img" -o elftool_out >/dev/null;
     mv -f elftool_out/header "$file-header" 2>/dev/null;
     rm -rf elftool_out;
-    "$bin/$arch/unpackelf" -i "$img";
+    aik_exec unpackelf -i "$img";
   ;;
   KRNL) dd bs=4096 skip=8 iflag=skip_bytes conv=notrunc if="$img" of="$file-ramdisk" 2>&1 | tail -n+3 | cut -d" " -f1-2;;
   OSIP)
-    "$bin/$arch/mboot" -u -f "$img";
+    aik_exec mboot -u -f "$img";
     [ ! $? -eq "0" ] && error=1;
     for i in bootstub cmdline.txt hdr kernel parameter ramdisk.cpio.gz sig; do
       mv -f $i "$file-$(basename $i .txt | sed -e 's/hdr/header/' -e 's/ramdisk.cpio.gz/ramdisk/')" 2>/dev/null || true;
     done;
   ;;
   U-Boot)
-    "$bin/$arch/dumpimage" -l "$img";
-    "$bin/$arch/dumpimage" -l "$img" > "$file-header";
+    aik_exec dumpimage -l "$img";
+    aik_exec dumpimage -l "$img" > "$file-header";
     grep "Name:" "$file-header" | cut -c15- > "$file-name";
     grep "Type:" "$file-header" | cut -c15- | cut -d" " -f1 > "$file-arch";
     grep "Type:" "$file-header" | cut -c15- | cut -d" " -f2 > "$file-os";
@@ -248,10 +244,10 @@ case $imgtype in
     grep "Address:" "$file-header" | cut -c15- > "$file-addr";
     grep "Point:" "$file-header" | cut -c15- > "$file-ep";
     rm -f "$file-header";
-    "$bin/$arch/dumpimage" -p 0 -o "$file-kernel" "$img";
+    aik_exec dumpimage -p 0 -o "$file-kernel" "$img";
     [ ! $? -eq "0" ] && error=1;
     case $(cat "$file-type") in
-      Multi) "$bin/$arch/dumpimage" -p 1 -o "$file-ramdisk" "$img";;
+      Multi) aik_exec dumpimage -p 1 -o "$file-ramdisk" "$img";;
       RAMDisk) mv -f "$file-kernel" "$file-ramdisk";;
       *) touch "$file-ramdisk";;
     esac;
@@ -318,8 +314,8 @@ case $ramdiskcomp in
   xz) ;;
   lzma) ;;
   bzip2) compext=bz2;;
-  lz4) unpackcmd="$bin/$arch/lz4 -dcq";;
-  lz4-l) unpackcmd="$bin/$arch/lz4 -dcq"; compext=lz4;;
+  lz4) unpackcmd="aik_exec lz4 -dcq";;
+  lz4-l) unpackcmd="aik_exec lz4 -dcq"; compext=lz4;;
   cpio) unpackcmd="cat"; compext="";;
   empty) compext=empty;;
   *) compext="";;
@@ -366,4 +362,3 @@ fi;
 echo " ";
 echo "Done!";
 exit 0;
-

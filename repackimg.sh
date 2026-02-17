@@ -2,55 +2,43 @@
 # AIK-Linux/repackimg: repack ramdisk and build image
 # osm0sis @ xda-developers
 
-abort() { echo "Error!"; }
+script_path="${BASH_SOURCE:-$0}";
+script_dir="$(cd "$(dirname "$script_path")" && pwd -P)";
+. "$script_dir/lib/runtime.sh";
+
+AIK_REQUIRED_TOOLS=(cpio dd lzop xz lz4 java mkbootimg mkimage);
+aik_bootstrap "$script_path" "$@" || exit $?;
+[ "$AIK_FORWARDED" = "1" ] && exit 0;
+if [ "$AIK_DOCTOR" = "1" ]; then
+  aik_doctor "${AIK_REQUIRED_TOOLS[@]}";
+  exit $?;
+fi;
+set -- "${AIK_ARGS[@]}";
+
+abort() { [ "$1" ] && echo "$1"; echo "Error!"; }
 
 case $1 in
-  --help) echo "usage: repackimg.sh [--local] [--original] [--origsize] [--level <0-9>] [--avbkey <name>] [--forceelf]"; exit 1;
+  --help) echo "usage: repackimg.sh [--runtime native|auto|container] [--container-image <image>] [--strict-native] [--doctor] [--native] [--local] [--original] [--origsize] [--level <0-9>] [--avbkey <name>] [--forceelf]"; exit 1;
 esac;
 
 case $(uname -s) in
-  Darwin|Macintosh)
-    plat="macos";
-    readlink() { perl -MCwd -e 'print Cwd::abs_path shift' "$2"; }
-  ;;
-  *) plat="linux";;
+  Darwin|Macintosh) plat="macos"; statarg="-f %Su";;
+  *) plat="linux"; statarg="-c %U";;
 esac;
-arch=$plat/`uname -m`;
+arch=$AIK_OS/$AIK_ARCH;
 
 aik="${BASH_SOURCE:-$0}";
-aik="$(dirname "$(readlink -f "$aik")")";
+aik="$(dirname "$(aik_readlink_f "$aik")")";
 bin="$aik/bin";
-cur="$(readlink -f "$PWD")";
-
-case $plat in
-  macos)
-    cpio="env DYLD_LIBRARY_PATH="$bin/$arch" "$bin/$arch/cpio"";
-    statarg="-f %Su";
-    dd() { DYLD_LIBRARY_PATH="$bin/$arch" "$bin/$arch/dd" "$@"; }
-    lzop() { DYLD_LIBRARY_PATH="$bin/$arch" "$bin/$arch/lzop" "$@"; }
-    truncate() { DYLD_LIBRARY_PATH="$bin/$arch" "$bin/$arch/truncate" "$@"; }
-    xz() { DYLD_LIBRARY_PATH="$bin/$arch" "$bin/$arch/xz" "$@"; }
-
-    javaver=$(java -version 2>&1 | head -n1 | cut -d\" -f2);
-    javamaj=$(echo $javaver | cut -d. -f1);
-    javamin=$(echo $javaver | cut -d. -f2);
-    if [ "$javamaj" -lt 9 ] && [ "$javamaj" -eq 1 -a "$javamin" -lt 8 ]; then
-      java() { "/Library/Internet Plug-Ins/JavaAppletPlugin.plugin/Contents/Home/bin/java" "$@"; }
-    fi;
-  ;;
-  linux)
-    cpio=cpio;
-    [ "$(cpio --version | head -n1 | rev | cut -d\  -f1 | rev)" = "2.13" ] && cpiowarning=1;
-    statarg="-c %U";
-  ;;
-esac;
+cur="$(aik_readlink_f "$PWD")";
+cpio=cpio;
+[ "$(cpio --version | head -n1 | rev | cut -d\  -f1 | rev)" = "2.13" ] && cpiowarning=1;
 
 case $1 in
   --local) shift;;
   *) cd "$aik";;
 esac;
-chmod -R 755 "$bin" "$aik/"*.sh;
-chmod 644 "$bin/magic" "$bin/androidbootimg.magic" "$bin/boot_signer.jar" "$bin/avb/"* "$bin/chromeos/"*;
+aik_fix_permissions "$aik" "$bin";
 
 if [ -z "$(ls split_img/* 2>/dev/null)" -o ! -e ramdisk ]; then
   echo "No files found to be packed/built.";
@@ -102,7 +90,9 @@ fi;
 rm -f "*-new.*";
 
 if [ -d ramdisk ] && [ "$(stat $statarg ramdisk | head -n 1)" = "root" ]; then
-  sudo=sudo; sumsg=" (as root)";
+  if command -v sudo >/dev/null 2>&1; then
+    sudo=sudo; sumsg=" (as root)";
+  fi;
 else
   cpioarg="-R 0:0";
 fi;
@@ -135,8 +125,8 @@ else
     xz) repackcmd="xz $level -Ccrc32";;
     lzma) repackcmd="xz $level -Flzma";;
     bzip2) compext=bz2;;
-    lz4) repackcmd="$bin/$arch/lz4 $level";;
-    lz4-l) repackcmd="$bin/$arch/lz4 $level -l"; compext=lz4;;
+    lz4) repackcmd="aik_exec lz4 $level";;
+    lz4-l) repackcmd="aik_exec lz4 $level -l"; compext=lz4;;
     cpio) repackcmd="cat"; compext="";;
     *) abort; exit 1;;
   esac;
@@ -238,7 +228,6 @@ case $imgtype in
     fi;
     if [ -f *-hashtype ]; then
       hashtype=`cat *-hashtype`;         echo "hashtype = $hashtype";
-      hashtype="--hashtype $hashtype";
     fi;
     if [ -f *-dt ]; then
       dttype=`cat *-dttype`;
@@ -263,7 +252,7 @@ if [ -f split_img/*-mtktype ]; then
   echo "Generating MTK headers...";
   echo " ";
   echo "Using ramdisk type: $mtktype";
-  "$bin/$arch/mkmtkhdr" --kernel "$kernel" --$mtktype "$ramdisk" >/dev/null;
+  aik_exec mkmtkhdr --kernel "$kernel" --$mtktype "$ramdisk" >/dev/null;
   if [ ! $? -eq "0" ]; then
     abort;
     exit 1;
@@ -292,19 +281,36 @@ echo "Building image...";
 echo " ";
 echo "Using format: $imgtype";
 echo " ";
+
+mkboot_opt=();
+[ "$cmdline" ] && cmdline_opt=(--cmdline "$cmdline");
+[ "$cmdline" ] && vendor_cmdline_opt=(--vendor_cmdline "$cmdline");
+[ "$board" ] && mkboot_opt+=(--board "$board");
+[ "$base" ] && mkboot_opt+=(--base "$base");
+[ "$pagesize" ] && mkboot_opt+=(--pagesize "$pagesize");
+[ "$kerneloff" ] && mkboot_opt+=(--kernel_offset "$kerneloff");
+[ "$ramdiskoff" ] && mkboot_opt+=(--ramdisk_offset "$ramdiskoff");
+[ "$secondoff" ] && mkboot_opt+=(--second_offset "$secondoff");
+[ "$tagsoff" ] && mkboot_opt+=(--tags_offset "$tagsoff");
+[ "$dtboff" ] && mkboot_opt+=(--dtb_offset "$dtboff");
+[ "$osver" ] && mkboot_opt+=(--os_version "$osver");
+[ "$oslvl" ] && mkboot_opt+=(--os_patch_level "$oslvl");
+[ "$hdrver" ] && mkboot_opt+=(--header_version "$hdrver");
+[ "$hashtype" ] && hashtype_opt=(--hashtype "$hashtype");
+
 case $imgtype in
-  AOSP_VNDR) "$bin/$arch/mkbootimg" --vendor_ramdisk "$ramdisk" "${dtb[@]}" --vendor_cmdline "$cmdline" --board "$board" --base $base --pagesize $pagesize --kernel_offset $kerneloff --ramdisk_offset $ramdiskoff --tags_offset $tagsoff --dtb_offset $dtboff --os_version "$osver" --os_patch_level "$oslvl" --header_version $hdrver --vendor_boot $outname;;
-  AOSP) "$bin/$arch/mkbootimg" --kernel "$kernel" --ramdisk "$ramdisk" "${second[@]}" "${dtb[@]}" "${recoverydtbo[@]}" --cmdline "$cmdline" --board "$board" --base $base --pagesize $pagesize --kernel_offset $kerneloff --ramdisk_offset $ramdiskoff --second_offset "$secondoff" --tags_offset "$tagsoff" --dtb_offset "$dtboff" --os_version "$osver" --os_patch_level "$oslvl" --header_version "$hdrver" $hashtype "${dt[@]}" -o $outname;;
-  AOSP-PXA) "$bin/$arch/pxa-mkbootimg" --kernel "$kernel" --ramdisk "$ramdisk" "${second[@]}" --cmdline "$cmdline" --board "$board" --base $base --pagesize $pagesize --kernel_offset $kerneloff --ramdisk_offset $ramdiskoff --second_offset "$secondoff" --tags_offset "$tagsoff" --unknown $unknown "${dt[@]}" -o $outname;;
-  ELF) "$bin/$arch/elftool" pack -o $outname header="$header" "$kernel" "$ramdisk",ramdisk "${rpm[@]}" "${cmd[@]}" >/dev/null;;
-  KRNL) "$bin/$arch/rkcrc" -k "$ramdisk" $outname;;
+  AOSP_VNDR) aik_exec mkbootimg --vendor_ramdisk "$ramdisk" "${dtb[@]}" "${vendor_cmdline_opt[@]}" "${mkboot_opt[@]}" --vendor_boot "$outname";;
+  AOSP) aik_exec mkbootimg --kernel "$kernel" --ramdisk "$ramdisk" "${second[@]}" "${dtb[@]}" "${recoverydtbo[@]}" "${cmdline_opt[@]}" "${mkboot_opt[@]}" "${hashtype_opt[@]}" "${dt[@]}" -o "$outname";;
+  AOSP-PXA) aik_exec pxa-mkbootimg --kernel "$kernel" --ramdisk "$ramdisk" "${second[@]}" --cmdline "$cmdline" --board "$board" --base $base --pagesize $pagesize --kernel_offset $kerneloff --ramdisk_offset $ramdiskoff --second_offset "$secondoff" --tags_offset "$tagsoff" --unknown $unknown "${dt[@]}" -o $outname;;
+  ELF) aik_exec elftool pack -o $outname header="$header" "$kernel" "$ramdisk",ramdisk "${rpm[@]}" "${cmd[@]}" >/dev/null;;
+  KRNL) aik_exec rkcrc -k "$ramdisk" $outname;;
   OSIP)
     mkdir split_img/.temp 2>/dev/null;
     for i in bootstub cmdline.txt hdr kernel parameter sig; do
       cp -f split_img/*-*$(basename $i .txt | sed -e 's/hdr/header/') split_img/.temp/$i 2>/dev/null;
     done;
     cp -f "$ramdisk" split_img/.temp/ramdisk.cpio.gz;
-    "$bin/$arch/mboot" -d split_img/.temp -f $outname;
+    aik_exec mboot -d split_img/.temp -f $outname;
   ;;
   U-Boot)
     part0="$kernel";
@@ -312,7 +318,7 @@ case $imgtype in
       Multi) part1=(:"$ramdisk");;
       RAMDisk) part0="$ramdisk";;
     esac;
-    "$bin/$arch/mkimage" -A $uarch -O $os -T $type -C $comp -a $addr -e $ep -n "$name" -d "$part0""${part1[@]}" $outname >/dev/null;
+    aik_exec mkimage -A $uarch -O $os -T $type -C $comp -a $addr -e $ep -n "$name" -d "$part0""${part1[@]}" $outname >/dev/null;
   ;;
   *) echo " "; echo "Unsupported format."; abort; exit 1;;
 esac;
@@ -337,16 +343,28 @@ if [ -f split_img/*-sigtype ]; then
   [ ! "$avbkey" ] && avbkey="$bin/avb/verity";
   echo " ";
   case $sigtype in
-    AVBv1) java -jar "$bin/boot_signer.jar" /$avbtype unsigned-new.img "$avbkey.pk8" "$avbkey.x509."* image-new.img 2>/dev/null;;
+    AVBv1)
+      if [ ! -f "$bin/boot_signer.jar" ] || [ ! -f "$avbkey.pk8" ] || [ -z "$(ls "$avbkey".x509.* 2>/dev/null)" ]; then
+        abort "Missing AVBv1 signing assets (boot_signer.jar or avb keys).";
+        exit 1;
+      fi;
+      java -jar "$bin/boot_signer.jar" /$avbtype unsigned-new.img "$avbkey.pk8" "$avbkey.x509."* image-new.img 2>/dev/null
+    ;;
     BLOB)
       awk 'BEGIN { printf "-SIGNED-BY-SIGNBLOB-\00\00\00\00\00\00\00\00" }' > image-new.img;
-      "$bin/$arch/blobpack" blob.tmp $blobtype unsigned-new.img >/dev/null;
+      aik_exec blobpack blob.tmp $blobtype unsigned-new.img >/dev/null;
       cat blob.tmp >> image-new.img;
       rm -f blob.tmp;
     ;;
-    CHROMEOS) "$bin/$arch/futility" vbutil_kernel --pack image-new.img --keyblock "$bin/chromeos/kernel.keyblock" --signprivate "$bin/chromeos/kernel_data_key.vbprivk" --version 1 --vmlinuz unsigned-new.img --bootloader "$bin/chromeos/empty" --config "$bin/chromeos/empty" --arch arm --flags 0x1;;
+    CHROMEOS)
+      if [ ! -f "$bin/chromeos/kernel.keyblock" ] || [ ! -f "$bin/chromeos/kernel_data_key.vbprivk" ] || [ ! -f "$bin/chromeos/empty" ]; then
+        abort "Missing ChromeOS signing assets in $bin/chromeos.";
+        exit 1;
+      fi;
+      aik_exec futility vbutil_kernel --pack image-new.img --keyblock "$bin/chromeos/kernel.keyblock" --signprivate "$bin/chromeos/kernel_data_key.vbprivk" --version 1 --vmlinuz unsigned-new.img --bootloader "$bin/chromeos/empty" --config "$bin/chromeos/empty" --arch arm --flags 0x1
+    ;;
     DHTB)
-      "$bin/$arch/dhtbsign" -i unsigned-new.img -o image-new.img >/dev/null;
+      aik_exec dhtbsign -i unsigned-new.img -o image-new.img >/dev/null;
       rm -f split_img/*-tailtype 2>/dev/null;
     ;;
     NOOK*) cat split_img/*-master_boot.key unsigned-new.img > image-new.img;;
@@ -365,7 +383,7 @@ if [ -f split_img/*-lokitype ]; then
   echo " ";
   mv -f image-new.img unlokied-new.img;
   if [ -f aboot.img ]; then
-    "$bin/$arch/loki_tool" patch $lokitype aboot.img unlokied-new.img image-new.img >/dev/null;
+    aik_exec loki_tool patch $lokitype aboot.img unlokied-new.img image-new.img >/dev/null;
     if [ ! $? -eq "0" ]; then
       echo "Patching failed.";
       abort;
@@ -409,4 +427,3 @@ fi;
 
 echo "Done!";
 exit 0;
-

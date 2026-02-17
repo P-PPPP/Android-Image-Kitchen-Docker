@@ -1,0 +1,7 @@
+.git
+.DS_Store
+split_img
+ramdisk
+*new.*
+*.img
+*.sin
